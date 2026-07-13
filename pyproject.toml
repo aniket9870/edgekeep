@@ -1,0 +1,17 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "edgekeep"
+version = "0.0.1"
+description = "Durable, offline-first telemetry delivery for edge gateways"
+readme = "README.md"
+license = "Apache-2.0"
+requires-python = ">=3.11"
+authors = [{ name = "Aniket" }]
+keywords = ["iot", "mqtt", "edge", "telemetry", "store-and-forward"]
+
+[project.urls]
+Homepage = "https://edgekeep.dev"
+Repository = "https://github.com/aniket9870/edgekeep"
