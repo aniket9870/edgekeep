@@ -15,3 +15,10 @@ keywords = ["iot", "mqtt", "edge", "telemetry", "store-and-forward"]
 [project.urls]
 Homepage = "https://edgekeep.dev"
 Repository = "https://github.com/aniket9870/edgekeep"
+
+[project.optional-dependencies]
+test = ["pytest>=8", "pytest-asyncio>=0.24"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
