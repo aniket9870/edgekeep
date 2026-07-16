@@ -1,12 +1,14 @@
-"""The SQLite-backed outbox: schema, state machine, publish(). No sender
-or transport in here — that's a separate piece and comes later.
+"""Outbox core: schema, state machine, publish(). Sender/transport isn't
+here yet, still coming.
 """
 
 from __future__ import annotations
 
+import asyncio
 import os
 import sqlite3
 import time
+from dataclasses import dataclass
 from typing import Self
 
 from edgekeep._uuid7 import uuid7_bytes
@@ -17,44 +19,74 @@ STATE_PENDING = 0
 STATE_INFLIGHT = 1
 STATE_DEAD = 2
 
-_SCHEMA_SQL = """
-CREATE TABLE keep_messages (
-    id              INTEGER PRIMARY KEY,
-    idempotency_key BLOB    NOT NULL UNIQUE,
-    source_id       TEXT    NOT NULL,
-    seq             INTEGER NOT NULL,
-    topic           TEXT    NOT NULL,
-    payload         BLOB    NOT NULL,
-    content_type    TEXT,
-    created_at      INTEGER NOT NULL,
-    state           INTEGER NOT NULL DEFAULT 0,
-    attempts        INTEGER NOT NULL DEFAULT 0,
-    next_retry_at   INTEGER,
-    last_error      TEXT,
-    UNIQUE (source_id, seq)
-);
+DEFAULT_COMMIT_WINDOW = 0.05
 
-CREATE INDEX idx_keep_pending
-    ON keep_messages (source_id, id)
-    WHERE state = 0;
+# executescript() auto-commits and won't play along with an explicit
+# transaction, so schema creation is done as separate statements run
+# one at a time — that's what actually keeps it atomic under a crash.
+_SCHEMA_STATEMENTS = (
+    """
+    CREATE TABLE keep_messages (
+        id              INTEGER PRIMARY KEY,
+        idempotency_key BLOB    NOT NULL UNIQUE,
+        source_id       TEXT    NOT NULL,
+        seq             INTEGER NOT NULL,
+        topic           TEXT    NOT NULL,
+        payload         BLOB    NOT NULL,
+        content_type    TEXT,
+        created_at      INTEGER NOT NULL,
+        state           INTEGER NOT NULL DEFAULT 0,
+        attempts        INTEGER NOT NULL DEFAULT 0,
+        next_retry_at   INTEGER,
+        last_error      TEXT,
+        UNIQUE (source_id, seq)
+    )
+    """,
+    """
+    CREATE INDEX idx_keep_pending
+        ON keep_messages (source_id, id)
+        WHERE state = 0
+    """,
+    """
+    CREATE TABLE keep_sources (
+        source_id  TEXT PRIMARY KEY,
+        next_seq   INTEGER NOT NULL DEFAULT 1,
+        bytes_used INTEGER NOT NULL DEFAULT 0
+    )
+    """,
+    """
+    CREATE TABLE keep_meta (
+        key   TEXT PRIMARY KEY,
+        value TEXT NOT NULL
+    )
+    """,
+)
 
-CREATE TABLE keep_sources (
-    source_id  TEXT PRIMARY KEY,
-    next_seq   INTEGER NOT NULL DEFAULT 1,
-    bytes_used INTEGER NOT NULL DEFAULT 0
-);
+# sentinel telling the writer "no more work is coming, flush and stop"
+_CLOSE = object()
 
-CREATE TABLE keep_meta (
-    key   TEXT PRIMARY KEY,
-    value TEXT NOT NULL
-);
-"""
+
+@dataclass
+class _QueuedPublish:
+    topic: str
+    payload: bytes
+    source_id: str
+    content_type: str | None
+    future: asyncio.Future[int]
 
 
 class Keep:
-    def __init__(self, path: str | os.PathLike[str]) -> None:
+    def __init__(
+        self,
+        path: str | os.PathLike[str],
+        *,
+        commit_window: float = DEFAULT_COMMIT_WINDOW,
+    ) -> None:
         self.path = path
+        self.commit_window = commit_window
         self._conn: sqlite3.Connection | None = None
+        self._queue: asyncio.Queue[object] | None = None
+        self._writer_task: asyncio.Task[None] | None = None
 
     async def __aenter__(self) -> Self:
         conn = sqlite3.connect(self.path, isolation_level=None)
@@ -65,11 +97,18 @@ class Keep:
             "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'keep_meta'"
         ).fetchone()
         if meta_table is None:
-            conn.executescript(_SCHEMA_SQL)
-            conn.execute(
-                "INSERT INTO keep_meta (key, value) VALUES ('schema_version', ?)",
-                (str(SCHEMA_VERSION),),
-            )
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                for statement in _SCHEMA_STATEMENTS:
+                    conn.execute(statement)
+                conn.execute(
+                    "INSERT INTO keep_meta (key, value) VALUES ('schema_version', ?)",
+                    (str(SCHEMA_VERSION),),
+                )
+            except BaseException:
+                conn.execute("ROLLBACK")
+                raise
+            conn.execute("COMMIT")
         else:
             row = conn.execute(
                 "SELECT value FROM keep_meta WHERE key = 'schema_version'"
@@ -89,6 +128,8 @@ class Keep:
         )
 
         self._conn = conn
+        self._queue = asyncio.Queue()
+        self._writer_task = asyncio.create_task(self._run_writer())
         return self
 
     async def __aexit__(self, *exc_info: object) -> None:
@@ -102,39 +143,123 @@ class Keep:
         source_id: str,
         content_type: str | None = None,
     ) -> int:
-        assert self._conn is not None, "publish() called before Keep was opened"
-        conn = self._conn
-        idempotency_key = uuid7_bytes()
-        created_at = time.time_ns() // 1_000_000
-
-        conn.execute("BEGIN IMMEDIATE")
-        try:
-            conn.execute(
-                "INSERT INTO keep_sources (source_id, next_seq) VALUES (?, 1) "
-                "ON CONFLICT (source_id) DO NOTHING",
-                (source_id,),
+        assert self._queue is not None, "publish() called before Keep was opened"
+        future: asyncio.Future[int] = asyncio.get_running_loop().create_future()
+        await self._queue.put(
+            _QueuedPublish(
+                topic=topic,
+                payload=payload,
+                source_id=source_id,
+                content_type=content_type,
+                future=future,
             )
-            (seq,) = conn.execute(
-                "SELECT next_seq FROM keep_sources WHERE source_id = ?",
-                (source_id,),
-            ).fetchone()
-            conn.execute(
-                "UPDATE keep_sources SET next_seq = next_seq + 1 WHERE source_id = ?",
-                (source_id,),
-            )
-            conn.execute(
-                "INSERT INTO keep_messages "
-                "(idempotency_key, source_id, seq, topic, payload, content_type, created_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (idempotency_key, source_id, seq, topic, payload, content_type, created_at),
-            )
-        except BaseException:
-            conn.execute("ROLLBACK")
-            raise
-        conn.execute("COMMIT")
-        return seq
+        )
+        return await future
 
     async def close(self) -> None:
+        if self._writer_task is not None:
+            assert self._queue is not None
+            await self._queue.put(_CLOSE)
+            await self._writer_task
+            self._writer_task = None
+            self._queue = None
         if self._conn is not None:
             self._conn.close()
             self._conn = None
+
+    async def _run_writer(self) -> None:
+        assert self._queue is not None
+        queue = self._queue
+
+        while True:
+            first = await queue.get()
+            if first is _CLOSE:
+                return
+
+            batch = [first]
+            closing = False
+
+            if self.commit_window > 0:
+                deadline = time.monotonic() + self.commit_window
+                while True:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        break
+                    try:
+                        item = await asyncio.wait_for(queue.get(), timeout=remaining)
+                    except TimeoutError:
+                        break
+                    if item is _CLOSE:
+                        closing = True
+                        break
+                    batch.append(item)
+            else:
+                # commit_window=0: grab whatever's already sitting in the
+                # queue but don't wait around for more, so there's no added
+                # latency beyond what's already been enqueued
+                while True:
+                    try:
+                        item = queue.get_nowait()
+                    except asyncio.QueueEmpty:
+                        break
+                    if item is _CLOSE:
+                        closing = True
+                        break
+                    batch.append(item)
+
+            self._commit_batch(batch)  # type: ignore[arg-type]
+
+            if closing:
+                return
+
+    def _commit_batch(self, batch: list[_QueuedPublish]) -> None:
+        conn = self._conn
+        assert conn is not None
+
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            seqs: list[int] = []
+            for item in batch:
+                idempotency_key = uuid7_bytes()
+                created_at = time.time_ns() // 1_000_000
+                conn.execute(
+                    "INSERT INTO keep_sources (source_id, next_seq) VALUES (?, 1) "
+                    "ON CONFLICT (source_id) DO NOTHING",
+                    (item.source_id,),
+                )
+                (seq,) = conn.execute(
+                    "SELECT next_seq FROM keep_sources WHERE source_id = ?",
+                    (item.source_id,),
+                ).fetchone()
+                conn.execute(
+                    "UPDATE keep_sources SET next_seq = next_seq + 1 WHERE source_id = ?",
+                    (item.source_id,),
+                )
+                conn.execute(
+                    "INSERT INTO keep_messages "
+                    "(idempotency_key, source_id, seq, topic, payload, content_type, created_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        idempotency_key,
+                        item.source_id,
+                        seq,
+                        item.topic,
+                        item.payload,
+                        item.content_type,
+                        created_at,
+                    ),
+                )
+                seqs.append(seq)
+            conn.execute("COMMIT")
+        except BaseException as exc:
+            try:
+                if conn.in_transaction:
+                    conn.execute("ROLLBACK")
+            except sqlite3.Error:
+                pass  # connection's already broken, nothing left to roll back
+            for item in batch:
+                item.future.set_exception(exc)
+            return
+
+        for item, seq in zip(batch, seqs):
+            item.future.set_result(seq)
