@@ -21,9 +21,10 @@ STATE_DEAD = 2
 
 DEFAULT_COMMIT_WINDOW = 0.05
 
-# executescript() auto-commits and won't play along with an explicit
-# transaction, so schema creation is done as separate statements run
-# one at a time — that's what actually keeps it atomic under a crash.
+# executescript() forces its own commit and won't honor an outer BEGIN,
+# so it can't take part in a transaction. Running each statement here
+# individually is just what lets them join the BEGIN/COMMIT below -
+# the atomicity comes from that transaction, not from the looping.
 _SCHEMA_STATEMENTS = (
     """
     CREATE TABLE keep_messages (
@@ -117,7 +118,7 @@ class Keep:
             if version != SCHEMA_VERSION:
                 raise RuntimeError(
                     f"keep at {self.path!r} is on schema_version {version!r}, "
-                    f"this build only knows {SCHEMA_VERSION} — no migration yet"
+                    f"this build only knows {SCHEMA_VERSION} - no migration yet"
                 )
 
         # a crash mid-send leaves rows claimed but never ack'd or requeued;
@@ -143,7 +144,15 @@ class Keep:
         source_id: str,
         content_type: str | None = None,
     ) -> int:
-        assert self._queue is not None, "publish() called before Keep was opened"
+        """Queue a message for durable delivery and return its per-source seq.
+
+        Returns once the row is committed locally, never once it's sent.
+        Cancelling the await after the message is enqueued doesn't pull it
+        back out - once queued, whether and when it gets committed is the
+        writer's call, not the caller's.
+        """
+        if self._queue is None:
+            raise RuntimeError("Keep is not open")
         future: asyncio.Future[int] = asyncio.get_running_loop().create_future()
         await self._queue.put(
             _QueuedPublish(
@@ -158,7 +167,8 @@ class Keep:
 
     async def close(self) -> None:
         if self._writer_task is not None:
-            assert self._queue is not None
+            if self._queue is None:
+                raise RuntimeError("Keep is not open")
             await self._queue.put(_CLOSE)
             await self._writer_task
             self._writer_task = None
@@ -171,46 +181,62 @@ class Keep:
         assert self._queue is not None
         queue = self._queue
 
-        while True:
-            first = await queue.get()
-            if first is _CLOSE:
-                return
+        try:
+            while True:
+                first = await queue.get()
+                if first is _CLOSE:
+                    return
 
-            batch = [first]
-            closing = False
+                batch = [first]
+                closing = False
 
-            if self.commit_window > 0:
-                deadline = time.monotonic() + self.commit_window
-                while True:
-                    remaining = deadline - time.monotonic()
-                    if remaining <= 0:
-                        break
-                    try:
-                        item = await asyncio.wait_for(queue.get(), timeout=remaining)
-                    except TimeoutError:
-                        break
-                    if item is _CLOSE:
-                        closing = True
-                        break
-                    batch.append(item)
-            else:
-                # commit_window=0: grab whatever's already sitting in the
-                # queue but don't wait around for more, so there's no added
-                # latency beyond what's already been enqueued
-                while True:
-                    try:
-                        item = queue.get_nowait()
-                    except asyncio.QueueEmpty:
-                        break
-                    if item is _CLOSE:
-                        closing = True
-                        break
-                    batch.append(item)
+                if self.commit_window > 0:
+                    deadline = time.monotonic() + self.commit_window
+                    while True:
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0:
+                            break
+                        try:
+                            item = await asyncio.wait_for(queue.get(), timeout=remaining)
+                        except TimeoutError:
+                            break
+                        if item is _CLOSE:
+                            closing = True
+                            break
+                        batch.append(item)
+                else:
+                    # commit_window=0: grab whatever's already sitting in the
+                    # queue but don't wait around for more, so there's no added
+                    # latency beyond what's already been enqueued
+                    while True:
+                        try:
+                            item = queue.get_nowait()
+                        except asyncio.QueueEmpty:
+                            break
+                        if item is _CLOSE:
+                            closing = True
+                            break
+                        batch.append(item)
 
-            self._commit_batch(batch)  # type: ignore[arg-type]
+                self._commit_batch(batch)  # type: ignore[arg-type]
 
-            if closing:
-                return
+                if closing:
+                    return
+        finally:
+            # a publish() racing close() can land behind the _CLOSE marker
+            # and never get picked up above - reject those rather than
+            # leaving the caller's future hanging forever
+            while True:
+                try:
+                    leftover = queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    break
+                if leftover is _CLOSE:
+                    continue
+                if not leftover.future.done():  # type: ignore[attr-defined]
+                    leftover.future.set_exception(  # type: ignore[attr-defined]
+                        RuntimeError("Keep was closed before this publish could be committed")
+                    )
 
     def _commit_batch(self, batch: list[_QueuedPublish]) -> None:
         conn = self._conn
@@ -258,8 +284,12 @@ class Keep:
             except sqlite3.Error:
                 pass  # connection's already broken, nothing left to roll back
             for item in batch:
-                item.future.set_exception(exc)
+                # caller may have cancelled its own await while this batch
+                # was in flight - don't try to resolve a future twice
+                if not item.future.done():
+                    item.future.set_exception(exc)
             return
 
         for item, seq in zip(batch, seqs):
-            item.future.set_result(seq)
+            if not item.future.done():
+                item.future.set_result(seq)
