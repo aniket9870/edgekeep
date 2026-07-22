@@ -76,6 +76,16 @@ class _QueuedPublish:
     future: asyncio.Future[int]
 
 
+@dataclass(frozen=True)
+class Metrics:
+    pending_messages: int
+    inflight_messages: int
+    dead_messages: int
+    keep_bytes_used: int
+    published_total: int
+    oldest_pending_age_seconds: float | None
+
+
 class Keep:
     def __init__(
         self,
@@ -88,6 +98,7 @@ class Keep:
         self._conn: sqlite3.Connection | None = None
         self._queue: asyncio.Queue[object] | None = None
         self._writer_task: asyncio.Task[None] | None = None
+        self._published_total = 0
 
     async def __aenter__(self) -> Self:
         conn = sqlite3.connect(self.path, isolation_level=None)
@@ -176,6 +187,45 @@ class Keep:
         if self._conn is not None:
             self._conn.close()
             self._conn = None
+
+    async def metrics(self) -> Metrics:
+        """A cheap read-only snapshot for health checks and alerting.
+
+        published_total is an in-memory counter for this process, not a
+        table scan — it resets if the process restarts, same as any other
+        in-memory counter would.
+        """
+        if self._conn is None:
+            raise RuntimeError("Keep is not open")
+        conn = self._conn
+
+        pending, inflight, dead, bytes_used, oldest_created_at = conn.execute(
+            """
+            SELECT
+                SUM(CASE WHEN state = ? THEN 1 ELSE 0 END),
+                SUM(CASE WHEN state = ? THEN 1 ELSE 0 END),
+                SUM(CASE WHEN state = ? THEN 1 ELSE 0 END),
+                COALESCE(SUM(LENGTH(payload)), 0),
+                MIN(CASE WHEN state = ? THEN created_at END)
+            FROM keep_messages
+            """,
+            (STATE_PENDING, STATE_INFLIGHT, STATE_DEAD, STATE_PENDING),
+        ).fetchone()
+
+        if oldest_created_at is None:
+            oldest_pending_age_seconds = None
+        else:
+            now_ms = time.time_ns() // 1_000_000
+            oldest_pending_age_seconds = (now_ms - oldest_created_at) / 1000
+
+        return Metrics(
+            pending_messages=pending or 0,
+            inflight_messages=inflight or 0,
+            dead_messages=dead or 0,
+            keep_bytes_used=bytes_used,
+            published_total=self._published_total,
+            oldest_pending_age_seconds=oldest_pending_age_seconds,
+        )
 
     async def _run_writer(self) -> None:
         assert self._queue is not None
@@ -290,6 +340,7 @@ class Keep:
                     item.future.set_exception(exc)
             return
 
+        self._published_total += len(batch)
         for item, seq in zip(batch, seqs):
             if not item.future.done():
                 item.future.set_result(seq)
