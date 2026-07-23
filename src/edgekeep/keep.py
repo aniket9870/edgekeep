@@ -83,6 +83,8 @@ class Metrics:
     dead_messages: int
     keep_bytes_used: int
     published_total: int
+    acked_total: int
+    retried_total: int
     oldest_pending_age_seconds: float | None
 
 
@@ -99,6 +101,9 @@ class Keep:
         self._queue: asyncio.Queue[object] | None = None
         self._writer_task: asyncio.Task[None] | None = None
         self._published_total = 0
+        # bumped by the sender once it exists -- always 0 until then
+        self._acked_total = 0
+        self._retried_total = 0
 
     async def __aenter__(self) -> Self:
         conn = sqlite3.connect(self.path, isolation_level=None)
@@ -224,6 +229,8 @@ class Keep:
             dead_messages=dead or 0,
             keep_bytes_used=bytes_used,
             published_total=self._published_total,
+            acked_total=self._acked_total,
+            retried_total=self._retried_total,
             oldest_pending_age_seconds=oldest_pending_age_seconds,
         )
 
