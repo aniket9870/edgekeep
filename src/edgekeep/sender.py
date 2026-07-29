@@ -1,20 +1,50 @@
-"""Claims PENDING rows and drives them through the broker. Doesn't do
-any of that yet - this is just enough surface for the M2 harness to run
-against and fail red before the claim/backoff/retry logic exists.
+"""Claims PENDING rows and drives them through the broker: publish over
+the transport at QoS 1, delete on ack, back off and retry on failure,
+give up to DEAD after enough permanent failures.
+
+Never touches SQLite directly -- every read or write goes through Keep's
+writer task via the _claim_next/_finalize_* methods. Two writers on one
+connection is exactly the kind of race that passes happy-path tests and
+corrupts under load.
 """
 
 from __future__ import annotations
 
 import asyncio
+import random
+import time
 
-from edgekeep.keep import Keep
-from edgekeep.transport import Transport
+from edgekeep.keep import ClaimedMessage, Keep
+from edgekeep.transport import PermanentError, Transport, TransportError
 
 DEFAULT_MAX_ATTEMPTS = 5
 DEFAULT_BASE_BACKOFF = 1.0
 DEFAULT_CAP_BACKOFF = 120.0
 DEFAULT_REPLAY_RATE_LIMIT = 100.0
 DEFAULT_MAX_INFLIGHT = 32
+
+_QOS = 1
+
+
+class _RateLimiter:
+    """A plain leaky bucket: reserves the next slot synchronously so
+    concurrent workers can't all slip through the gate at once, then
+    sleeps off whatever's left of the wait.
+    """
+
+    def __init__(self, rate_per_second: float) -> None:
+        self._interval = 1.0 / rate_per_second if rate_per_second > 0 else 0.0
+        self._next_slot = time.monotonic()
+
+    async def wait_for_slot(self) -> None:
+        if self._interval <= 0:
+            return
+        now = time.monotonic()
+        slot = max(self._next_slot, now)
+        self._next_slot = slot + self._interval
+        delay = slot - now
+        if delay > 0:
+            await asyncio.sleep(delay)
 
 
 class Sender:
@@ -36,8 +66,50 @@ class Sender:
         self.cap_backoff = cap_backoff
         self.replay_rate_limit = replay_rate_limit
         self.max_inflight = max_inflight
+        self._rate_limiter = _RateLimiter(replay_rate_limit)
 
     async def run_forever(self) -> None:
-        # doesn't claim or publish anything yet - just parks here so
-        # callers have something to await without blowing up on import
-        await asyncio.Event().wait()
+        # each worker only ever has one claim in flight, and a claim never
+        # succeeds for a source that already has one INFLIGHT -- so the
+        # worker count alone is what caps concurrency, no semaphore needed
+        workers = [
+            asyncio.create_task(self._worker()) for _ in range(max(1, self.max_inflight))
+        ]
+        await asyncio.gather(*workers)
+
+    async def _worker(self) -> None:
+        while True:
+            await self._rate_limiter.wait_for_slot()
+            claimed = await self.keep._claim_next()
+            if claimed is None:
+                await asyncio.sleep(0.05)
+                continue
+            await self._handle(claimed)
+
+    async def _handle(self, claimed: ClaimedMessage) -> None:
+        try:
+            await self.transport.publish(
+                topic=claimed.topic, payload=claimed.payload, qos=_QOS
+            )
+        except PermanentError as exc:
+            await self._fail(claimed, exc, permanent=True)
+        except TransportError as exc:
+            await self._fail(claimed, exc, permanent=False)
+        else:
+            await self.keep._finalize_ack(claimed.id)
+
+    async def _fail(self, claimed: ClaimedMessage, exc: Exception, *, permanent: bool) -> None:
+        attempts = claimed.attempts + 1
+
+        # transport errors are unlimited -- only a permanent error's own
+        # attempt count can send a message to DEAD
+        if permanent and attempts >= self.max_attempts:
+            await self.keep._finalize_dead(claimed.id, attempts=attempts, error=str(exc))
+            return
+
+        backoff = min(self.cap_backoff, self.base_backoff * (2**attempts))
+        backoff *= random.uniform(0.5, 1.5)
+        next_retry_at_ms = time.time_ns() // 1_000_000 + int(backoff * 1000)
+        await self.keep._finalize_retry(
+            claimed.id, attempts=attempts, next_retry_at_ms=next_retry_at_ms, error=str(exc)
+        )

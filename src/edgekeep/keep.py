@@ -1,5 +1,5 @@
-"""Outbox core: schema, state machine, publish(). Sender/transport isn't
-here yet, still coming.
+"""Outbox core: schema, state machine, publish(), and the writer-side
+half of the sender's claim/ack/retry/dead operations.
 """
 
 from __future__ import annotations
@@ -76,6 +76,57 @@ class _QueuedPublish:
     future: asyncio.Future[int]
 
 
+@dataclass
+class _QueuedClaim:
+    """Claim the oldest eligible PENDING row across all sources that don't
+    already have one INFLIGHT. Result is None if nothing's eligible.
+    """
+
+    future: asyncio.Future[ClaimedMessage | None]
+
+
+@dataclass
+class _QueuedAck:
+    message_id: int
+    future: asyncio.Future[None]
+
+
+@dataclass
+class _QueuedRetry:
+    message_id: int
+    attempts: int
+    next_retry_at_ms: int
+    error: str
+    future: asyncio.Future[None]
+
+
+@dataclass
+class _QueuedDead:
+    message_id: int
+    attempts: int
+    error: str
+    future: asyncio.Future[None]
+
+
+_QueuedItem = _QueuedPublish | _QueuedClaim | _QueuedAck | _QueuedRetry | _QueuedDead
+
+
+@dataclass(frozen=True)
+class ClaimedMessage:
+    """What the sender gets back from a successful claim -- everything it
+    needs to attempt delivery without ever touching SQLite itself.
+    """
+
+    id: int
+    idempotency_key: bytes
+    source_id: str
+    seq: int
+    topic: str
+    payload: bytes
+    content_type: str | None
+    attempts: int
+
+
 @dataclass(frozen=True)
 class Metrics:
     pending_messages: int
@@ -101,7 +152,6 @@ class Keep:
         self._queue: asyncio.Queue[object] | None = None
         self._writer_task: asyncio.Task[None] | None = None
         self._published_total = 0
-        # bumped by the sender once it exists -- always 0 until then
         self._acked_total = 0
         self._retried_total = 0
 
@@ -234,6 +284,55 @@ class Keep:
             oldest_pending_age_seconds=oldest_pending_age_seconds,
         )
 
+    # -- sender-facing internals -------------------------------------
+    #
+    # The sender lives in its own module and drives these instead of
+    # touching SQLite itself. Everything still goes through the one
+    # writer task that owns the connection -- claiming, acking, and
+    # retrying are just other kinds of work that queue can carry.
+
+    async def _claim_next(self) -> ClaimedMessage | None:
+        if self._queue is None:
+            raise RuntimeError("Keep is not open")
+        future: asyncio.Future[ClaimedMessage | None] = (
+            asyncio.get_running_loop().create_future()
+        )
+        await self._queue.put(_QueuedClaim(future=future))
+        return await future
+
+    async def _finalize_ack(self, message_id: int) -> None:
+        if self._queue is None:
+            raise RuntimeError("Keep is not open")
+        future: asyncio.Future[None] = asyncio.get_running_loop().create_future()
+        await self._queue.put(_QueuedAck(message_id=message_id, future=future))
+        await future
+
+    async def _finalize_retry(
+        self, message_id: int, *, attempts: int, next_retry_at_ms: int, error: str
+    ) -> None:
+        if self._queue is None:
+            raise RuntimeError("Keep is not open")
+        future: asyncio.Future[None] = asyncio.get_running_loop().create_future()
+        await self._queue.put(
+            _QueuedRetry(
+                message_id=message_id,
+                attempts=attempts,
+                next_retry_at_ms=next_retry_at_ms,
+                error=error,
+                future=future,
+            )
+        )
+        await future
+
+    async def _finalize_dead(self, message_id: int, *, attempts: int, error: str) -> None:
+        if self._queue is None:
+            raise RuntimeError("Keep is not open")
+        future: asyncio.Future[None] = asyncio.get_running_loop().create_future()
+        await self._queue.put(
+            _QueuedDead(message_id=message_id, attempts=attempts, error=error, future=future)
+        )
+        await future
+
     async def _run_writer(self) -> None:
         assert self._queue is not None
         queue = self._queue
@@ -247,7 +346,11 @@ class Keep:
                 batch = [first]
                 closing = False
 
-                if self.commit_window > 0:
+                # only publishes wait around for company -- claim/ack/retry
+                # are latency-sensitive control-plane calls from the sender,
+                # so they get committed right away instead of sitting through
+                # someone else's commit_window
+                if self.commit_window > 0 and isinstance(first, _QueuedPublish):
                     deadline = time.monotonic() + self.commit_window
                     while True:
                         remaining = deadline - time.monotonic()
@@ -262,9 +365,9 @@ class Keep:
                             break
                         batch.append(item)
                 else:
-                    # commit_window=0: grab whatever's already sitting in the
-                    # queue but don't wait around for more, so there's no added
-                    # latency beyond what's already been enqueued
+                    # either commit_window=0 or this round didn't start with
+                    # a publish -- grab whatever's already sitting in the
+                    # queue for free, but don't wait around for more
                     while True:
                         try:
                             item = queue.get_nowait()
@@ -275,7 +378,7 @@ class Keep:
                             break
                         batch.append(item)
 
-                self._commit_batch(batch)  # type: ignore[arg-type]
+                self._commit_batch(batch)
 
                 if closing:
                     return
@@ -295,44 +398,13 @@ class Keep:
                         RuntimeError("Keep was closed before this publish could be committed")
                     )
 
-    def _commit_batch(self, batch: list[_QueuedPublish]) -> None:
+    def _commit_batch(self, batch: list[_QueuedItem]) -> None:
         conn = self._conn
         assert conn is not None
 
         try:
             conn.execute("BEGIN IMMEDIATE")
-            seqs: list[int] = []
-            for item in batch:
-                idempotency_key = uuid7_bytes()
-                created_at = time.time_ns() // 1_000_000
-                conn.execute(
-                    "INSERT INTO keep_sources (source_id, next_seq) VALUES (?, 1) "
-                    "ON CONFLICT (source_id) DO NOTHING",
-                    (item.source_id,),
-                )
-                (seq,) = conn.execute(
-                    "SELECT next_seq FROM keep_sources WHERE source_id = ?",
-                    (item.source_id,),
-                ).fetchone()
-                conn.execute(
-                    "UPDATE keep_sources SET next_seq = next_seq + 1 WHERE source_id = ?",
-                    (item.source_id,),
-                )
-                conn.execute(
-                    "INSERT INTO keep_messages "
-                    "(idempotency_key, source_id, seq, topic, payload, content_type, created_at) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
-                    (
-                        idempotency_key,
-                        item.source_id,
-                        seq,
-                        item.topic,
-                        item.payload,
-                        item.content_type,
-                        created_at,
-                    ),
-                )
-                seqs.append(seq)
+            results: list[object] = [self._apply(conn, item) for item in batch]
             conn.execute("COMMIT")
         except BaseException as exc:
             try:
@@ -347,7 +419,111 @@ class Keep:
                     item.future.set_exception(exc)
             return
 
-        self._published_total += len(batch)
-        for item, seq in zip(batch, seqs):
+        self._published_total += sum(1 for item in batch if isinstance(item, _QueuedPublish))
+        self._acked_total += sum(1 for item in batch if isinstance(item, _QueuedAck))
+        self._retried_total += sum(1 for item in batch if isinstance(item, _QueuedRetry))
+
+        for item, result in zip(batch, results):
             if not item.future.done():
-                item.future.set_result(seq)
+                item.future.set_result(result)
+
+    def _apply(self, conn: sqlite3.Connection, item: _QueuedItem) -> object:
+        if isinstance(item, _QueuedPublish):
+            return self._apply_publish(conn, item)
+        if isinstance(item, _QueuedClaim):
+            return self._apply_claim(conn)
+        if isinstance(item, _QueuedAck):
+            return self._apply_ack(conn, item)
+        if isinstance(item, _QueuedRetry):
+            return self._apply_retry(conn, item)
+        if isinstance(item, _QueuedDead):
+            return self._apply_dead(conn, item)
+        raise AssertionError(f"unhandled queued item: {item!r}")
+
+    def _apply_publish(self, conn: sqlite3.Connection, item: _QueuedPublish) -> int:
+        idempotency_key = uuid7_bytes()
+        created_at = time.time_ns() // 1_000_000
+        conn.execute(
+            "INSERT INTO keep_sources (source_id, next_seq) VALUES (?, 1) "
+            "ON CONFLICT (source_id) DO NOTHING",
+            (item.source_id,),
+        )
+        (seq,) = conn.execute(
+            "SELECT next_seq FROM keep_sources WHERE source_id = ?",
+            (item.source_id,),
+        ).fetchone()
+        conn.execute(
+            "UPDATE keep_sources SET next_seq = next_seq + 1 WHERE source_id = ?",
+            (item.source_id,),
+        )
+        conn.execute(
+            "INSERT INTO keep_messages "
+            "(idempotency_key, source_id, seq, topic, payload, content_type, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (
+                idempotency_key,
+                item.source_id,
+                seq,
+                item.topic,
+                item.payload,
+                item.content_type,
+                created_at,
+            ),
+        )
+        return seq
+
+    def _apply_claim(self, conn: sqlite3.Connection) -> ClaimedMessage | None:
+        now_ms = time.time_ns() // 1_000_000
+        row = conn.execute(
+            """
+            UPDATE keep_messages
+            SET state = ?
+            WHERE id = (
+                SELECT m.id FROM keep_messages m
+                WHERE m.state = ?
+                  AND (m.next_retry_at IS NULL OR m.next_retry_at <= ?)
+                  AND NOT EXISTS (
+                      SELECT 1 FROM keep_messages i
+                      WHERE i.source_id = m.source_id AND i.state = ?
+                  )
+                ORDER BY m.source_id, m.id
+                LIMIT 1
+            )
+            RETURNING id, idempotency_key, source_id, seq, topic, payload,
+                      content_type, attempts
+            """,
+            (STATE_INFLIGHT, STATE_PENDING, now_ms, STATE_INFLIGHT),
+        ).fetchone()
+        if row is None:
+            return None
+        (id_, idempotency_key, source_id, seq, topic, payload, content_type, attempts) = row
+        return ClaimedMessage(
+            id=id_,
+            idempotency_key=idempotency_key,
+            source_id=source_id,
+            seq=seq,
+            topic=topic,
+            payload=payload,
+            content_type=content_type,
+            attempts=attempts,
+        )
+
+    def _apply_ack(self, conn: sqlite3.Connection, item: _QueuedAck) -> None:
+        conn.execute("DELETE FROM keep_messages WHERE id = ?", (item.message_id,))
+        return None
+
+    def _apply_retry(self, conn: sqlite3.Connection, item: _QueuedRetry) -> None:
+        conn.execute(
+            "UPDATE keep_messages "
+            "SET state = ?, attempts = ?, next_retry_at = ?, last_error = ? "
+            "WHERE id = ?",
+            (STATE_PENDING, item.attempts, item.next_retry_at_ms, item.error, item.message_id),
+        )
+        return None
+
+    def _apply_dead(self, conn: sqlite3.Connection, item: _QueuedDead) -> None:
+        conn.execute(
+            "UPDATE keep_messages SET state = ?, attempts = ?, last_error = ? WHERE id = ?",
+            (STATE_DEAD, item.attempts, item.error, item.message_id),
+        )
+        return None
