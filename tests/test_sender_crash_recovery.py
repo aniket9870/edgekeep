@@ -69,11 +69,23 @@ async def test_sigkill_between_claim_and_ack_never_loses_a_message(tmp_path: Pat
         stderr=subprocess.PIPE,
         text=True,
     )
-    time.sleep(random.uniform(0.05, 0.5))
+    # worker needs ~130ms just for interpreter + import + schema-creation
+    # startup before its first publish() can even return -- start the
+    # window above that so we're not mostly just measuring process spawn
+    time.sleep(random.uniform(0.2, 0.6))
     proc.send_signal(signal.SIGKILL)
     stdout, _stderr = proc.communicate(timeout=5)
 
     confirmed = _confirmed(stdout)
+
+    # if the kill landed before the worker even got one publish() back, the
+    # rest of this test is vacuous -- both checks below would trivially
+    # "pass" on zero evidence. fail loudly instead of pretending that's a
+    # real crash-recovery run.
+    assert confirmed, (
+        "worker was killed before confirming a single publish; this run "
+        "can't exercise crash recovery -- rerun, or widen the sleep window"
+    )
 
     # recovery, then give a real sender a chance to finish delivering
     # whatever the crash left behind
