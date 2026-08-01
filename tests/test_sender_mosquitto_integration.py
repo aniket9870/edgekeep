@@ -1,9 +1,6 @@
 """Thin integration check against a real broker on localhost:1883. Skips
 itself automatically if nothing's listening there - CI doesn't need to
 run a broker for the rest of the suite to mean anything.
-
-MqttTransport isn't wired up to aiomqtt yet, so this stays red (or
-skipped) until both it and the sender are real.
 """
 
 from __future__ import annotations

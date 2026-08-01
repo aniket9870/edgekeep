@@ -11,6 +11,7 @@ license = "Apache-2.0"
 requires-python = ">=3.11"
 authors = [{ name = "Aniket" }]
 keywords = ["iot", "mqtt", "edge", "telemetry", "store-and-forward"]
+dependencies = ["aiomqtt>=2.0"]
 
 [project.urls]
 Homepage = "https://edgekeep.dev"
