@@ -11,11 +11,14 @@ corrupts under load.
 from __future__ import annotations
 
 import asyncio
+import logging
 import random
 import time
 
 from edgekeep.keep import ClaimedMessage, Keep
 from edgekeep.transport import PermanentError, Transport, TransportError
+
+_logger = logging.getLogger(__name__)
 
 DEFAULT_MAX_ATTEMPTS = 5
 DEFAULT_BASE_BACKOFF = 1.0
@@ -79,12 +82,22 @@ class Sender:
 
     async def _worker(self) -> None:
         while True:
-            await self._rate_limiter.wait_for_slot()
-            claimed = await self.keep._claim_next()
-            if claimed is None:
+            try:
+                await self._rate_limiter.wait_for_slot()
+                claimed = await self.keep._claim_next()
+                if claimed is None:
+                    await asyncio.sleep(0.05)
+                    continue
+                await self._handle(claimed)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                # last-resort net: whatever this was, it happened outside
+                # a claimed message (rate limiter, claim() itself), so
+                # there's no row to requeue -- just don't let it take the
+                # whole worker down with it
+                _logger.exception("sender worker hit an unexpected error")
                 await asyncio.sleep(0.05)
-                continue
-            await self._handle(claimed)
 
     async def _handle(self, claimed: ClaimedMessage) -> None:
         try:
@@ -94,6 +107,14 @@ class Sender:
         except PermanentError as exc:
             await self._fail(claimed, exc, permanent=True)
         except TransportError as exc:
+            await self._fail(claimed, exc, permanent=False)
+        except Exception as exc:
+            # anything neither error type anticipated -- a transport bug,
+            # something from aiomqtt's internals -- still leaves the row
+            # claimed INFLIGHT with nobody driving it if we let it propagate.
+            # treat it like any other transient failure instead of orphaning
+            # the message until the next process restart
+            _logger.exception("unexpected error publishing message %s", claimed.id)
             await self._fail(claimed, exc, permanent=False)
         else:
             await self.keep._finalize_ack(claimed.id)
