@@ -8,10 +8,12 @@ import asyncio
 import os
 import sqlite3
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Self
 
 from edgekeep._uuid7 import uuid7_bytes
+from edgekeep.eviction import DropOldest, EvictedMessage, EvictionPolicy
 
 SCHEMA_VERSION = 1
 
@@ -20,6 +22,8 @@ STATE_INFLIGHT = 1
 STATE_DEAD = 2
 
 DEFAULT_COMMIT_WINDOW = 0.05
+DEFAULT_MAX_BYTES = 256 * 2**20
+DEFAULT_MAX_MESSAGES = 1_000_000
 
 # executescript() forces its own commit and won't honor an outer BEGIN,
 # so it can't take part in a transaction. Running each statement here
@@ -136,6 +140,7 @@ class Metrics:
     published_total: int
     acked_total: int
     retried_total: int
+    evicted_total: int
     oldest_pending_age_seconds: float | None
 
 
@@ -145,15 +150,24 @@ class Keep:
         path: str | os.PathLike[str],
         *,
         commit_window: float = DEFAULT_COMMIT_WINDOW,
+        max_bytes: int = DEFAULT_MAX_BYTES,
+        max_messages: int = DEFAULT_MAX_MESSAGES,
+        eviction: EvictionPolicy | None = None,
+        on_evict: Callable[[EvictedMessage], None] | None = None,
     ) -> None:
         self.path = path
         self.commit_window = commit_window
+        self.max_bytes = max_bytes
+        self.max_messages = max_messages
+        self.eviction = eviction if eviction is not None else DropOldest()
+        self.on_evict = on_evict
         self._conn: sqlite3.Connection | None = None
         self._queue: asyncio.Queue[object] | None = None
         self._writer_task: asyncio.Task[None] | None = None
         self._published_total = 0
         self._acked_total = 0
         self._retried_total = 0
+        self._evicted_total = 0
 
     async def __aenter__(self) -> Self:
         conn = sqlite3.connect(self.path, isolation_level=None)
@@ -281,6 +295,7 @@ class Keep:
             published_total=self._published_total,
             acked_total=self._acked_total,
             retried_total=self._retried_total,
+            evicted_total=self._evicted_total,
             oldest_pending_age_seconds=oldest_pending_age_seconds,
         )
 
