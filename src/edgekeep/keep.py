@@ -5,6 +5,7 @@ half of the sender's claim/ack/retry/dead operations.
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import sqlite3
 import time
@@ -14,6 +15,8 @@ from typing import Self
 
 from edgekeep._uuid7 import uuid7_bytes
 from edgekeep.eviction import DropOldest, EvictedMessage, EvictionPolicy
+
+_logger = logging.getLogger(__name__)
 
 SCHEMA_VERSION = 1
 
@@ -131,6 +134,56 @@ class ClaimedMessage:
     attempts: int
 
 
+class _EvictionContextImpl:
+    """What a policy sees during a publish's own transaction. Only
+    PENDING rows are ever eligible -- INFLIGHT means a sender is mid
+    delivery on it, and DEAD messages just sit there taking up space
+    for now, not reclaimable by DropOldest.
+    """
+
+    def __init__(self, conn: sqlite3.Connection, keep: Keep) -> None:
+        self._conn = conn
+        self._keep = keep
+
+    def over_bound(self) -> bool:
+        conn = self._conn
+        (total_bytes,) = conn.execute(
+            "SELECT COALESCE(SUM(bytes_used), 0) FROM keep_sources"
+        ).fetchone()
+        (total_messages,) = conn.execute("SELECT COUNT(*) FROM keep_messages").fetchone()
+        return total_bytes > self._keep.max_bytes or total_messages > self._keep.max_messages
+
+    def evict_oldest_pending(self) -> EvictedMessage | None:
+        conn = self._conn
+        row = conn.execute(
+            """
+            DELETE FROM keep_messages
+            WHERE id = (
+                SELECT id FROM keep_messages WHERE state = ? ORDER BY id LIMIT 1
+            )
+            RETURNING id, idempotency_key, source_id, seq, topic, LENGTH(payload)
+            """,
+            (STATE_PENDING,),
+        ).fetchone()
+        if row is None:
+            return None
+        id_, idempotency_key, source_id, seq, topic, payload_size = row
+        conn.execute(
+            "UPDATE keep_sources SET bytes_used = bytes_used - ? WHERE source_id = ?",
+            (payload_size, source_id),
+        )
+        evicted = EvictedMessage(
+            id=id_,
+            idempotency_key=idempotency_key,
+            source_id=source_id,
+            seq=seq,
+            topic=topic,
+            payload_size=payload_size,
+        )
+        self._keep._batch_evictions.append(evicted)
+        return evicted
+
+
 @dataclass(frozen=True)
 class Metrics:
     pending_messages: int
@@ -168,6 +221,10 @@ class Keep:
         self._acked_total = 0
         self._retried_total = 0
         self._evicted_total = 0
+        # collects evictions produced while applying the batch currently
+        # being committed -- only acted on (counter/log/callback) once
+        # COMMIT actually succeeds, never while still inside the txn
+        self._batch_evictions: list[EvictedMessage] = []
 
     async def __aenter__(self) -> Self:
         conn = sqlite3.connect(self.path, isolation_level=None)
@@ -268,6 +325,11 @@ class Keep:
             raise RuntimeError("Keep is not open")
         conn = self._conn
 
+        # this is a plain scan, not the incrementally-maintained
+        # keep_sources.bytes_used -- that counter only stays correct for
+        # rows Keep itself deleted (ack/eviction), and metrics() has to be
+        # right regardless of what touched the table, so it earns its own
+        # query here rather than trusting the fast path eviction uses
         pending, inflight, dead, bytes_used, oldest_created_at = conn.execute(
             """
             SELECT
@@ -417,6 +479,11 @@ class Keep:
         conn = self._conn
         assert conn is not None
 
+        # reset before applying -- evictions produced while working through
+        # this batch aren't real until COMMIT succeeds, so nothing here
+        # should act on them yet
+        self._batch_evictions = []
+
         try:
             conn.execute("BEGIN IMMEDIATE")
             results: list[object] = [self._apply(conn, item) for item in batch]
@@ -427,6 +494,7 @@ class Keep:
                     conn.execute("ROLLBACK")
             except sqlite3.Error:
                 pass  # connection's already broken, nothing left to roll back
+            self._batch_evictions = []  # rolled back -- these never happened
             for item in batch:
                 # caller may have cancelled its own await while this batch
                 # was in flight - don't try to resolve a future twice
@@ -437,6 +505,25 @@ class Keep:
         self._published_total += sum(1 for item in batch if isinstance(item, _QueuedPublish))
         self._acked_total += sum(1 for item in batch if isinstance(item, _QueuedAck))
         self._retried_total += sum(1 for item in batch if isinstance(item, _QueuedRetry))
+
+        # only now, after COMMIT, are these evictions real -- counter, log,
+        # and callback each fire exactly once per evicted message
+        for evicted in self._batch_evictions:
+            self._evicted_total += 1
+            _logger.info(
+                "evicted message id=%s source_id=%s seq=%s topic=%s payload_size=%s",
+                evicted.id, evicted.source_id, evicted.seq, evicted.topic, evicted.payload_size,
+            )
+            if self.on_evict is not None:
+                try:
+                    self.on_evict(evicted)
+                except Exception:
+                    # a caller's callback misbehaving shouldn't be able to
+                    # take the writer task down with it
+                    _logger.exception(
+                        "on_evict callback raised for evicted message id=%s", evicted.id
+                    )
+        self._batch_evictions = []
 
         for item, result in zip(batch, results):
             if not item.future.done():
@@ -468,8 +555,9 @@ class Keep:
             (item.source_id,),
         ).fetchone()
         conn.execute(
-            "UPDATE keep_sources SET next_seq = next_seq + 1 WHERE source_id = ?",
-            (item.source_id,),
+            "UPDATE keep_sources SET next_seq = next_seq + 1, bytes_used = bytes_used + ? "
+            "WHERE source_id = ?",
+            (len(item.payload), item.source_id),
         )
         conn.execute(
             "INSERT INTO keep_messages "
@@ -485,6 +573,13 @@ class Keep:
                 created_at,
             ),
         )
+
+        # bound enforcement happens right here, inside the same txn as the
+        # insert above -- there's never a window where a reader could see
+        # the keep sitting over its bound
+        ctx = _EvictionContextImpl(conn, self)
+        self.eviction.enforce(ctx)
+
         return seq
 
     def _apply_claim(self, conn: sqlite3.Connection) -> ClaimedMessage | None:
@@ -524,7 +619,19 @@ class Keep:
         )
 
     def _apply_ack(self, conn: sqlite3.Connection, item: _QueuedAck) -> None:
-        conn.execute("DELETE FROM keep_messages WHERE id = ?", (item.message_id,))
+        # ack deletes a row same as eviction does -- bytes_used has to
+        # come back down here too, or it only ever grows and every bound
+        # check downstream is working off a stale number
+        row = conn.execute(
+            "DELETE FROM keep_messages WHERE id = ? RETURNING source_id, LENGTH(payload)",
+            (item.message_id,),
+        ).fetchone()
+        if row is not None:
+            source_id, payload_size = row
+            conn.execute(
+                "UPDATE keep_sources SET bytes_used = bytes_used - ? WHERE source_id = ?",
+                (payload_size, source_id),
+            )
         return None
 
     def _apply_retry(self, conn: sqlite3.Connection, item: _QueuedRetry) -> None:
