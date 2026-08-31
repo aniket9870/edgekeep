@@ -28,6 +28,10 @@ DEFAULT_COMMIT_WINDOW = 0.05
 DEFAULT_MAX_BYTES = 256 * 2**20
 DEFAULT_MAX_MESSAGES = 1_000_000
 
+# running total of rows in keep_messages, kept in sync on every
+# insert/ack/evict so we're not doing a COUNT(*) on every publish
+_MESSAGE_COUNT_KEY = "message_count"
+
 # executescript() forces its own commit and won't honor an outer BEGIN,
 # so it can't take part in a transaction. Running each statement here
 # individually is just what lets them join the BEGIN/COMMIT below -
@@ -134,6 +138,13 @@ class ClaimedMessage:
     attempts: int
 
 
+def _bump_message_count(conn: sqlite3.Connection, delta: int) -> None:
+    conn.execute(
+        "UPDATE keep_meta SET value = CAST(CAST(value AS INTEGER) + ? AS TEXT) WHERE key = ?",
+        (delta, _MESSAGE_COUNT_KEY),
+    )
+
+
 class _EvictionContextImpl:
     """What a policy sees during a publish's own transaction. Only
     PENDING rows are ever eligible -- INFLIGHT means a sender is mid
@@ -150,8 +161,10 @@ class _EvictionContextImpl:
         (total_bytes,) = conn.execute(
             "SELECT COALESCE(SUM(bytes_used), 0) FROM keep_sources"
         ).fetchone()
-        (total_messages,) = conn.execute("SELECT COUNT(*) FROM keep_messages").fetchone()
-        return total_bytes > self._keep.max_bytes or total_messages > self._keep.max_messages
+        (total_messages,) = conn.execute(
+            "SELECT value FROM keep_meta WHERE key = ?", (_MESSAGE_COUNT_KEY,)
+        ).fetchone()
+        return total_bytes > self._keep.max_bytes or int(total_messages) > self._keep.max_messages
 
     def evict_oldest_pending(self) -> EvictedMessage | None:
         conn = self._conn
@@ -172,6 +185,7 @@ class _EvictionContextImpl:
             "UPDATE keep_sources SET bytes_used = bytes_used - ? WHERE source_id = ?",
             (payload_size, source_id),
         )
+        _bump_message_count(conn, -1)
         evicted = EvictedMessage(
             id=id_,
             idempotency_key=idempotency_key,
@@ -265,6 +279,19 @@ class Keep:
             (STATE_PENDING, STATE_INFLIGHT),
         )
 
+        # backfill the counter if it's missing -- fresh db or an old one
+        # from before this existed, doesn't matter, both start from a
+        # real count and stay in sync from here on
+        count_row = conn.execute(
+            "SELECT 1 FROM keep_meta WHERE key = ?", (_MESSAGE_COUNT_KEY,)
+        ).fetchone()
+        if count_row is None:
+            (existing_count,) = conn.execute("SELECT COUNT(*) FROM keep_messages").fetchone()
+            conn.execute(
+                "INSERT INTO keep_meta (key, value) VALUES (?, ?)",
+                (_MESSAGE_COUNT_KEY, str(existing_count)),
+            )
+
         self._conn = conn
         self._queue = asyncio.Queue()
         self._writer_task = asyncio.create_task(self._run_writer())
@@ -325,22 +352,22 @@ class Keep:
             raise RuntimeError("Keep is not open")
         conn = self._conn
 
-        # this is a plain scan, not the incrementally-maintained
-        # keep_sources.bytes_used -- that counter only stays correct for
-        # rows Keep itself deleted (ack/eviction), and metrics() has to be
-        # right regardless of what touched the table, so it earns its own
-        # query here rather than trusting the fast path eviction uses
-        pending, inflight, dead, bytes_used, oldest_created_at = conn.execute(
+        pending, inflight, dead, oldest_created_at = conn.execute(
             """
             SELECT
                 SUM(CASE WHEN state = ? THEN 1 ELSE 0 END),
                 SUM(CASE WHEN state = ? THEN 1 ELSE 0 END),
                 SUM(CASE WHEN state = ? THEN 1 ELSE 0 END),
-                COALESCE(SUM(LENGTH(payload)), 0),
                 MIN(CASE WHEN state = ? THEN created_at END)
             FROM keep_messages
             """,
             (STATE_PENDING, STATE_INFLIGHT, STATE_DEAD, STATE_PENDING),
+        ).fetchone()
+
+        # same query over_bound() uses -- used to scan keep_messages for
+        # this instead, now it's one number both places agree on
+        (bytes_used,) = conn.execute(
+            "SELECT COALESCE(SUM(bytes_used), 0) FROM keep_sources"
         ).fetchone()
 
         if oldest_created_at is None:
@@ -573,6 +600,7 @@ class Keep:
                 created_at,
             ),
         )
+        _bump_message_count(conn, 1)
 
         # bound enforcement happens right here, inside the same txn as the
         # insert above -- there's never a window where a reader could see
@@ -619,9 +647,8 @@ class Keep:
         )
 
     def _apply_ack(self, conn: sqlite3.Connection, item: _QueuedAck) -> None:
-        # ack deletes a row same as eviction does -- bytes_used has to
-        # come back down here too, or it only ever grows and every bound
-        # check downstream is working off a stale number
+        # this deletes a row too, so bytes_used/message_count need to
+        # come down here just like they do on eviction
         row = conn.execute(
             "DELETE FROM keep_messages WHERE id = ? RETURNING source_id, LENGTH(payload)",
             (item.message_id,),
@@ -632,6 +659,7 @@ class Keep:
                 "UPDATE keep_sources SET bytes_used = bytes_used - ? WHERE source_id = ?",
                 (payload_size, source_id),
             )
+            _bump_message_count(conn, -1)
         return None
 
     def _apply_retry(self, conn: sqlite3.Connection, item: _QueuedRetry) -> None:

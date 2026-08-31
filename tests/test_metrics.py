@@ -44,14 +44,26 @@ async def test_metrics_after_publish(tmp_path: Path) -> None:
 
 
 def _mark_acked(db_path: Path, source_id: str, seq: int) -> None:
-    # ACKED rows are deleted, not flagged -- this is what a real sender
-    # will do once the broker PUBACKs a message
+    # ACKED rows are deleted, not flagged -- same as a real sender would
+    # do. bytes_used and message_count are counters now, not scans, so
+    # this has to update them too or metrics() ends up out of sync.
     conn = sqlite3.connect(db_path)
     try:
-        conn.execute(
-            "DELETE FROM keep_messages WHERE source_id = ? AND seq = ?",
+        row = conn.execute(
+            "DELETE FROM keep_messages WHERE source_id = ? AND seq = ? "
+            "RETURNING LENGTH(payload)",
             (source_id, seq),
-        )
+        ).fetchone()
+        if row is not None:
+            (payload_size,) = row
+            conn.execute(
+                "UPDATE keep_sources SET bytes_used = bytes_used - ? WHERE source_id = ?",
+                (payload_size, source_id),
+            )
+            conn.execute(
+                "UPDATE keep_meta SET value = CAST(CAST(value AS INTEGER) - 1 AS TEXT) "
+                "WHERE key = 'message_count'"
+            )
         conn.commit()
     finally:
         conn.close()
