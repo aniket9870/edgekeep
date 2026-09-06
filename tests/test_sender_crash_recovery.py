@@ -16,7 +16,6 @@ import signal
 import sqlite3
 import subprocess
 import sys
-import threading
 import time
 from pathlib import Path
 
@@ -25,6 +24,7 @@ import pytest
 from edgekeep import Keep
 from edgekeep.sender import Sender
 from _fake_transport import DurableFakeTransport
+from _stdout_reader import StdoutReader
 
 WORKER = Path(__file__).parent / "_crash_worker_sender.py"
 LINE_RE = re.compile(r"^(?P<source_id>[^\t]+)\t(?P<seq>\d+)\t(?P<i>\d+)$")
@@ -40,37 +40,6 @@ def _confirmed(stdout: str) -> list[tuple[str, int, int]]:
             continue
         out.append((match["source_id"], int(match["seq"]), int(match["i"])))
     return out
-
-
-class _StdoutReader:
-    """Drains a subprocess's stdout on a background thread for its whole
-    lifetime, so the test can wait for the *first confirmed line* instead
-    of a fixed sleep-then-kill -- a blind sleep races process-spawn and
-    scheduler jitter and produces vacuous runs under load.
-    """
-
-    def __init__(self, proc: subprocess.Popen[str]) -> None:
-        self._lock = threading.Lock()
-        self._lines: list[str] = []
-        self._got_first = threading.Event()
-        self._thread = threading.Thread(target=self._run, args=(proc,), daemon=True)
-        self._thread.start()
-
-    def _run(self, proc: subprocess.Popen[str]) -> None:
-        assert proc.stdout is not None
-        for line in proc.stdout:
-            with self._lock:
-                self._lines.append(line.rstrip("\n"))
-            if LINE_RE.match(self._lines[-1]):
-                self._got_first.set()
-
-    def wait_for_first_confirmation(self, timeout: float) -> bool:
-        return self._got_first.wait(timeout=timeout)
-
-    def join_and_collect(self, timeout: float) -> str:
-        self._thread.join(timeout=timeout)
-        with self._lock:
-            return "\n".join(self._lines)
 
 
 async def _drain_with_a_live_sender(db_path: Path, ack_log_path: Path, timeout: float) -> None:
@@ -101,7 +70,7 @@ async def test_sigkill_between_claim_and_ack_never_loses_a_message(
         stderr=subprocess.DEVNULL,
         text=True,
     )
-    reader = _StdoutReader(proc)
+    reader = StdoutReader(proc, LINE_RE)
     got_first = reader.wait_for_first_confirmation(timeout=5)
 
     # if the kill landed before the worker even got one publish() back, the

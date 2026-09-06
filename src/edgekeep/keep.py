@@ -9,16 +9,17 @@ import logging
 import os
 import sqlite3
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import Self
 
 from edgekeep._uuid7 import uuid7_bytes
 from edgekeep.eviction import DropOldest, EvictedMessage, EvictionPolicy
+from edgekeep.transform import PluginStorage, Transform
 
 _logger = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 STATE_PENDING = 0
 STATE_INFLIGHT = 1
@@ -27,6 +28,7 @@ STATE_DEAD = 2
 DEFAULT_COMMIT_WINDOW = 0.05
 DEFAULT_MAX_BYTES = 256 * 2**20
 DEFAULT_MAX_MESSAGES = 1_000_000
+DEFAULT_TRANSFORM_TIMEOUT = 5.0
 
 # running total of rows in keep_messages, kept in sync on every
 # insert/ack/evict so we're not doing a COUNT(*) on every publish
@@ -70,6 +72,14 @@ _SCHEMA_STATEMENTS = (
     CREATE TABLE keep_meta (
         key   TEXT PRIMARY KEY,
         value TEXT NOT NULL
+    )
+    """,
+    """
+    CREATE TABLE plugin_storage (
+        namespace TEXT NOT NULL,
+        key       TEXT NOT NULL,
+        value     BLOB NOT NULL,
+        PRIMARY KEY (namespace, key)
     )
     """,
 )
@@ -221,12 +231,16 @@ class Keep:
         max_messages: int = DEFAULT_MAX_MESSAGES,
         eviction: EvictionPolicy | None = None,
         on_evict: Callable[[EvictedMessage], None] | None = None,
+        transforms: Sequence[Transform] = (),
+        transform_timeout: float = DEFAULT_TRANSFORM_TIMEOUT,
     ) -> None:
         self.path = path
         self.commit_window = commit_window
         self.max_bytes = max_bytes
         self.max_messages = max_messages
         self.eviction = eviction if eviction is not None else DropOldest()
+        self.transforms = list(transforms)
+        self.transform_timeout = transform_timeout
         self.on_evict = on_evict
         self._conn: sqlite3.Connection | None = None
         self._queue: asyncio.Queue[object] | None = None
@@ -340,6 +354,15 @@ class Keep:
         if self._conn is not None:
             self._conn.close()
             self._conn = None
+
+    def plugin_storage(self, namespace: str) -> PluginStorage:
+        """A namespaced key/value handle for a plugin's own state, backed
+        by the same connection as everything else here. Wire it into a
+        Transform however that plugin wants (constructor arg, attribute,
+        whatever) -- just only actually call get()/set() on it from
+        inside that transform's on_ingest().
+        """
+        return PluginStorage(self, namespace)
 
     async def metrics(self) -> Metrics:
         """A cheap read-only snapshot for health checks and alerting.
