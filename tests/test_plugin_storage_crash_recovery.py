@@ -1,11 +1,8 @@
-"""New crash surface once transforms exist: SIGKILL between a transform's
+"""Crash surface added by transforms: SIGKILL between a transform's
 plugin_storage write and the outbox commit for the message(s) it produced.
 They're supposed to be the same transaction, so this is really testing
 that the transaction boundary is where we think it is -- no counter bump
 without both of its messages, no message pair without its counter bump.
-
-Nothing wires a transform into the writer's transaction yet, so this
-stays red until it does.
 """
 
 from __future__ import annotations
@@ -19,17 +16,20 @@ import sys
 import time
 from pathlib import Path
 
+import pytest
+
 from _stdout_reader import StdoutReader
 
 WORKER = Path(__file__).parent / "_crash_worker_plugin.py"
 LINE_RE = re.compile(r"^(?P<i>\d+)$")
 
-# single run for now while this is still red, same as the other crash
-# harnesses were before their sender/writer side was real -- bump to
-# N-iterations once this passes
+N_ITERATIONS = 20
 
 
-async def test_sigkill_never_splits_plugin_storage_from_its_messages(tmp_path: Path) -> None:
+@pytest.mark.parametrize("iteration", range(N_ITERATIONS))
+async def test_sigkill_never_splits_plugin_storage_from_its_messages(
+    tmp_path: Path, iteration: int
+) -> None:
     db_path = tmp_path / "keep.db"
 
     proc = subprocess.Popen(

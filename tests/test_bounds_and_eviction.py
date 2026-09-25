@@ -23,10 +23,11 @@ STATE_DEAD = 2
 
 
 async def _publish_n(keep: Keep, source_id: str, n: int, payload_size: int = 10) -> list[int]:
-    return [
-        await keep.publish(topic="t", payload=bytes(payload_size), source_id=source_id)
-        for _ in range(n)
-    ]
+    seqs = []
+    for _ in range(n):
+        [seq] = await keep.publish(topic="t", payload=bytes(payload_size), source_id=source_id)
+        seqs.append(seq)
+    return seqs
 
 
 def _seqs(db_path: Path, source_id: str = "s") -> list[int]:
@@ -68,7 +69,7 @@ async def test_drop_oldest_preserves_seq_gap(tmp_path: Path) -> None:
     db_path = tmp_path / "keep.db"
     async with Keep(db_path, max_messages=3, eviction=DropOldest()) as keep:
         await _publish_n(keep, "s", 5)  # seq 1, 2 evicted along the way
-        new_seq = await keep.publish(topic="t", payload=b"x", source_id="s")
+        [new_seq] = await keep.publish(topic="t", payload=b"x", source_id="s")
 
     # next_seq keeps counting past what got evicted instead of being
     # rewound or compacted -- the gap where 1 and 2 used to be is exactly

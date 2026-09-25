@@ -23,7 +23,7 @@ async def test_publish_rejected_if_stranded_behind_close(tmp_path: Path) -> None
 
         # manufacture the race directly: a message queued right behind the
         # close sentinel, same as a publish() that loses to a concurrent close()
-        future: asyncio.Future[int] = asyncio.get_running_loop().create_future()
+        future: asyncio.Future[list[int]] = asyncio.get_running_loop().create_future()
         await keep._queue.put(_CLOSE)
         await keep._queue.put(
             _QueuedPublish(
@@ -49,7 +49,7 @@ async def test_writer_survives_caller_cancelling_pending_publish(tmp_path: Path)
 
         # the cancelled publish's row may still land (nothing pulls it back
         # out of the batch), but the writer itself must still be alive
-        seq = await asyncio.wait_for(
+        [seq] = await asyncio.wait_for(
             keep.publish(topic="t", payload=b"y", source_id="s"), timeout=2
         )
         assert seq == 2

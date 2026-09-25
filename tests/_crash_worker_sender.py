@@ -23,7 +23,7 @@ async def main(db_path: str, ack_log_path: str) -> None:
         i = 0
         while True:
             source_id = SOURCES[i % len(SOURCES)]
-            seq = await keep.publish(
+            [seq] = await keep.publish(
                 topic=f"site-01/telemetry/{source_id}",
                 payload=str(i).encode(),
                 source_id=source_id,

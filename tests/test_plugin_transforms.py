@@ -41,8 +41,18 @@ class _AppendSuffixTransform:
 
 
 class _DropTransform:
-    async def on_ingest(self, draft: Draft) -> None:
-        return None
+    """Drops one specific payload, passes everything else through --
+    conditional so a test can mix a dropped publish in with ones that
+    should still land normally.
+    """
+
+    def __init__(self, drop_payload: bytes) -> None:
+        self._drop_payload = drop_payload
+
+    async def on_ingest(self, draft: Draft) -> list[Draft] | None:
+        if draft.payload == self._drop_payload:
+            return None
+        return [draft]
 
 
 class _FanOutTransform:
@@ -124,7 +134,7 @@ async def test_transform_returning_none_drops_the_message_and_consumes_no_seq(
     tmp_path: Path,
 ) -> None:
     db_path = tmp_path / "keep.db"
-    async with Keep(db_path, transforms=[_DropTransform()]) as keep:
+    async with Keep(db_path, transforms=[_DropTransform(drop_payload=b"dropped")]) as keep:
         seqs = await keep.publish(topic="t", payload=b"dropped", source_id="s")
         assert seqs == []
 

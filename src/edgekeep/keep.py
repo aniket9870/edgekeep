@@ -15,7 +15,7 @@ from typing import Self
 
 from edgekeep._uuid7 import uuid7_bytes
 from edgekeep.eviction import DropOldest, EvictedMessage, EvictionPolicy
-from edgekeep.transform import PluginStorage, Transform
+from edgekeep.transform import Draft, PluginStorage, Transform, TransformTimeoutError
 
 _logger = logging.getLogger(__name__)
 
@@ -84,6 +84,22 @@ _SCHEMA_STATEMENTS = (
     """,
 )
 
+# forward-only migrations, keyed on the version they bring a db up to.
+# a fresh db skips this entirely (it gets _SCHEMA_STATEMENTS directly,
+# already at SCHEMA_VERSION) -- this is only for opening an older one.
+_MIGRATIONS: dict[int, tuple[str, ...]] = {
+    2: (
+        """
+        CREATE TABLE plugin_storage (
+            namespace TEXT NOT NULL,
+            key       TEXT NOT NULL,
+            value     BLOB NOT NULL,
+            PRIMARY KEY (namespace, key)
+        )
+        """,
+    ),
+}
+
 # sentinel telling the writer "no more work is coming, flush and stop"
 _CLOSE = object()
 
@@ -94,7 +110,7 @@ class _QueuedPublish:
     payload: bytes
     source_id: str
     content_type: str | None
-    future: asyncio.Future[int]
+    future: asyncio.Future[list[int]]
 
 
 @dataclass
@@ -280,11 +296,25 @@ class Keep:
                 "SELECT value FROM keep_meta WHERE key = 'schema_version'"
             ).fetchone()
             version = int(row[0]) if row else None
-            if version != SCHEMA_VERSION:
+            if version is None or version > SCHEMA_VERSION:
                 raise RuntimeError(
                     f"keep at {self.path!r} is on schema_version {version!r}, "
-                    f"this build only knows {SCHEMA_VERSION} - no migration yet"
+                    f"this build only knows up to schema_version {SCHEMA_VERSION}"
                 )
+            if version < SCHEMA_VERSION:
+                conn.execute("BEGIN IMMEDIATE")
+                try:
+                    for target_version in range(version + 1, SCHEMA_VERSION + 1):
+                        for statement in _MIGRATIONS[target_version]:
+                            conn.execute(statement)
+                    conn.execute(
+                        "UPDATE keep_meta SET value = ? WHERE key = 'schema_version'",
+                        (str(SCHEMA_VERSION),),
+                    )
+                except BaseException:
+                    conn.execute("ROLLBACK")
+                    raise
+                conn.execute("COMMIT")
 
         # a crash mid-send leaves rows claimed but never ack'd or requeued;
         # put them back before publish() or anything else can touch the table
@@ -321,17 +351,22 @@ class Keep:
         payload: bytes,
         source_id: str,
         content_type: str | None = None,
-    ) -> int:
-        """Queue a message for durable delivery and return its per-source seq.
+    ) -> list[int]:
+        """Queue a message for durable delivery and return the seq(s) it
+        landed at.
 
-        Returns once the row is committed locally, never once it's sent.
-        Cancelling the await after the message is enqueued doesn't pull it
-        back out - once queued, whether and when it gets committed is the
-        writer's call, not the caller's.
+        Usually a list of one, but a transform can turn this into zero
+        (dropped) or several (fan-out) -- there's no honest single int
+        that covers that range, so this always returns a list.
+
+        Returns once everything's committed locally, never once it's
+        sent. Cancelling the await after the message is enqueued doesn't
+        pull it back out - once queued, whether and when it gets
+        committed is the writer's call, not the caller's.
         """
         if self._queue is None:
             raise RuntimeError("Keep is not open")
-        future: asyncio.Future[int] = asyncio.get_running_loop().create_future()
+        future: asyncio.Future[list[int]] = asyncio.get_running_loop().create_future()
         await self._queue.put(
             _QueuedPublish(
                 topic=topic,
@@ -505,7 +540,7 @@ class Keep:
                             break
                         batch.append(item)
 
-                self._commit_batch(batch)
+                await self._commit_batch(batch)
 
                 if closing:
                     return
@@ -525,7 +560,7 @@ class Keep:
                         RuntimeError("Keep was closed before this publish could be committed")
                     )
 
-    def _commit_batch(self, batch: list[_QueuedItem]) -> None:
+    async def _commit_batch(self, batch: list[_QueuedItem]) -> None:
         conn = self._conn
         assert conn is not None
 
@@ -534,9 +569,43 @@ class Keep:
         # should act on them yet
         self._batch_evictions = []
 
+        # transforms can await, so this loop isn't atomic in the "never
+        # yields" sense the rest of the writer relies on elsewhere -- but
+        # it's still one BEGIN...COMMIT, and each item gets its own
+        # SAVEPOINT so a transform rejecting its own publish doesn't take
+        # down whatever else happened to land in this batch. a real
+        # sqlite3.Error is different -- that means the connection itself
+        # is in trouble, so it aborts everything rather than just one item.
+        #
+        # one side effect worth knowing: since this now has await points
+        # mid-transaction, something like metrics() could in principle
+        # run concurrently and read this transaction's uncommitted state.
+        # not a correctness bug (nothing's corrupted, the eventual commit
+        # is still atomic) but a possible stale/dirty read if you call
+        # metrics() while a slow transform is stuck mid-publish.
         try:
             conn.execute("BEGIN IMMEDIATE")
-            results: list[object] = [self._apply(conn, item) for item in batch]
+        except sqlite3.Error as exc:
+            for item in batch:
+                if not item.future.done():
+                    item.future.set_exception(exc)
+            return
+
+        results: list[object] = []
+        try:
+            for index, item in enumerate(batch):
+                conn.execute(f"SAVEPOINT item_{index}")
+                try:
+                    result = await self._apply(conn, item)
+                except Exception as exc:
+                    if isinstance(exc, sqlite3.Error):
+                        raise
+                    conn.execute(f"ROLLBACK TO item_{index}")
+                    conn.execute(f"RELEASE item_{index}")
+                    results.append(exc)
+                else:
+                    conn.execute(f"RELEASE item_{index}")
+                    results.append(result)
             conn.execute("COMMIT")
         except BaseException as exc:
             try:
@@ -552,9 +621,18 @@ class Keep:
                     item.future.set_exception(exc)
             return
 
-        self._published_total += sum(1 for item in batch if isinstance(item, _QueuedPublish))
-        self._acked_total += sum(1 for item in batch if isinstance(item, _QueuedAck))
-        self._retried_total += sum(1 for item in batch if isinstance(item, _QueuedRetry))
+        succeeded = [not isinstance(result, BaseException) for result in results]
+        self._published_total += sum(
+            1
+            for item, ok in zip(batch, succeeded)
+            if ok and isinstance(item, _QueuedPublish)
+        )
+        self._acked_total += sum(
+            1 for item, ok in zip(batch, succeeded) if ok and isinstance(item, _QueuedAck)
+        )
+        self._retried_total += sum(
+            1 for item, ok in zip(batch, succeeded) if ok and isinstance(item, _QueuedRetry)
+        )
 
         # only now, after COMMIT, are these evictions real -- counter, log,
         # and callback each fire exactly once per evicted message
@@ -576,12 +654,16 @@ class Keep:
         self._batch_evictions = []
 
         for item, result in zip(batch, results):
-            if not item.future.done():
+            if item.future.done():
+                continue
+            if isinstance(result, BaseException):
+                item.future.set_exception(result)
+            else:
                 item.future.set_result(result)
 
-    def _apply(self, conn: sqlite3.Connection, item: _QueuedItem) -> object:
+    async def _apply(self, conn: sqlite3.Connection, item: _QueuedItem) -> object:
         if isinstance(item, _QueuedPublish):
-            return self._apply_publish(conn, item)
+            return await self._apply_publish(conn, item)
         if isinstance(item, _QueuedClaim):
             return self._apply_claim(conn)
         if isinstance(item, _QueuedAck):
@@ -592,22 +674,61 @@ class Keep:
             return self._apply_dead(conn, item)
         raise AssertionError(f"unhandled queued item: {item!r}")
 
-    def _apply_publish(self, conn: sqlite3.Connection, item: _QueuedPublish) -> int:
+    async def _apply_publish(self, conn: sqlite3.Connection, item: _QueuedPublish) -> list[int]:
+        drafts: list[Draft] = [
+            Draft(
+                topic=item.topic,
+                payload=item.payload,
+                source_id=item.source_id,
+                content_type=item.content_type,
+            )
+        ]
+
+        for transform in self.transforms:
+            if not drafts:
+                break  # already dropped -- nothing left for later transforms
+            next_drafts: list[Draft] = []
+            for draft in drafts:
+                try:
+                    result = await asyncio.wait_for(
+                        transform.on_ingest(draft), timeout=self.transform_timeout
+                    )
+                except TimeoutError as exc:
+                    raise TransformTimeoutError(
+                        f"{transform!r}.on_ingest() did not return within "
+                        f"{self.transform_timeout}s"
+                    ) from exc
+                if result is not None:
+                    next_drafts.extend(result)
+            drafts = next_drafts
+
+        seqs = [self._insert_draft(conn, draft) for draft in drafts]
+
+        if seqs:
+            # bound enforcement happens right here, inside the same txn as
+            # the inserts above -- there's never a window where a reader
+            # could see the keep sitting over its bound
+            ctx = _EvictionContextImpl(conn, self)
+            self.eviction.enforce(ctx)
+
+        return seqs
+
+    def _insert_draft(self, conn: sqlite3.Connection, draft: Draft) -> int:
         idempotency_key = uuid7_bytes()
         created_at = time.time_ns() // 1_000_000
         conn.execute(
             "INSERT INTO keep_sources (source_id, next_seq) VALUES (?, 1) "
             "ON CONFLICT (source_id) DO NOTHING",
-            (item.source_id,),
+            (draft.source_id,),
         )
         (seq,) = conn.execute(
             "SELECT next_seq FROM keep_sources WHERE source_id = ?",
-            (item.source_id,),
+            (draft.source_id,),
         ).fetchone()
         conn.execute(
             "UPDATE keep_sources SET next_seq = next_seq + 1, bytes_used = bytes_used + ? "
             "WHERE source_id = ?",
-            (len(item.payload), item.source_id),
+            (len(draft.payload), draft.source_id),
         )
         conn.execute(
             "INSERT INTO keep_messages "
@@ -615,22 +736,15 @@ class Keep:
             "VALUES (?, ?, ?, ?, ?, ?, ?)",
             (
                 idempotency_key,
-                item.source_id,
+                draft.source_id,
                 seq,
-                item.topic,
-                item.payload,
-                item.content_type,
+                draft.topic,
+                draft.payload,
+                draft.content_type,
                 created_at,
             ),
         )
         _bump_message_count(conn, 1)
-
-        # bound enforcement happens right here, inside the same txn as the
-        # insert above -- there's never a window where a reader could see
-        # the keep sitting over its bound
-        ctx = _EvictionContextImpl(conn, self)
-        self.eviction.enforce(ctx)
-
         return seq
 
     def _apply_claim(self, conn: sqlite3.Connection) -> ClaimedMessage | None:
